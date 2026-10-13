@@ -440,7 +440,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun sendMessage(userText: String, imageUri: android.net.Uri? = null) {
         val trimmed = userText.trim()
         if ((trimmed.isEmpty() && imageUri == null) || _isGenerating.value) return
-        if (conversation == null) return
+        if (conversation == null && dolphinEngine == null) return
 
         val startMs = System.currentTimeMillis()
         var firstTokenMs: Long? = null
@@ -482,6 +482,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _messages.value = _messages.value + botMsg
 
         _isGenerating.value = true
+        stopDolphin.set(false)
+
+        if (dolphinEngine != null) {
+            generateDolphinReply(botMsgId, startMs)
+            return
+        }
 
         viewModelScope.launch {
             try {
@@ -615,10 +621,97 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Formats Dolphin's native ChatML template using recent local conversation history. */
+    private fun buildDolphinPrompt(): String = buildString {
+        append("<|im_start|>system\n")
+        append("You are Dolphin, a capable offline AI assistant. Be accurate, helpful, and direct.")
+        append("<|im_end|>\n")
+        _messages.value.filter { it.text.isNotBlank() && (it.isUser || !it.isStreaming) }
+            .takeLast(12)
+            .forEach { msg ->
+                append(if (msg.isUser) "<|im_start|>user\n" else "<|im_start|>assistant\n")
+                append(msg.text)
+                append("<|im_end|>\n")
+            }
+        append("<|im_start|>assistant\n")
+    }
+
+    private fun generateDolphinReply(botMsgId: Long, startMs: Long) {
+        val active = dolphinEngine ?: return
+        val prompt = buildDolphinPrompt()
+        viewModelScope.launch {
+            val buffer = ByteArrayOutputStream()
+            val began = SystemClock.elapsedRealtime()
+            var lastUiUpdate = began
+            var firstPiece = 0L
+            var pieces = 0
+            try {
+                val tokens = withContext(Dispatchers.IO) {
+                    active.generate(prompt, ChunkListener { part ->
+                        val now = SystemClock.elapsedRealtime()
+                        if (firstPiece == 0L) firstPiece = now
+                        buffer.write(part)
+                        pieces++
+                        // Throttled Flow writes keep the Compose chat list responsive.
+                        if (now - lastUiUpdate >= 80L) {
+                            lastUiUpdate = now
+                            val preview = buffer.toString("UTF-8")
+                            val metrics = BenchmarkMetrics(
+                                ttftMs = firstPiece - began,
+                                decodeTps = if (now > firstPiece) pieces * 1000.0 / (now - firstPiece) else 0.0,
+                                decodeTokens = pieces,
+                                totalDurationMs = System.currentTimeMillis() - startMs,
+                                backend = "CPU · llama.cpp (estimated)"
+                            )
+                            _messages.update { list -> list.map { msg ->
+                                if (msg.id == botMsgId) msg.copy(text = preview, benchmark = metrics) else msg
+                            } }
+                        }
+                        !stopDolphin.get()
+                    })
+                }
+                val elapsed = SystemClock.elapsedRealtime() - began
+                val firstMs = if (firstPiece == 0L) elapsed else firstPiece - began
+                val metrics = BenchmarkMetrics(
+                    ttftMs = firstMs,
+                    decodeTps = if (elapsed > firstMs) tokens * 1000.0 / (elapsed - firstMs) else 0.0,
+                    decodeTokens = tokens.coerceAtLeast(0),
+                    totalDurationMs = System.currentTimeMillis() - startMs,
+                    backend = "CPU · llama.cpp (estimated)"
+                )
+                _messages.update { list -> list.map { msg ->
+                    if (msg.id == botMsgId) msg.copy(
+                        text = buffer.toString("UTF-8"), isStreaming = false, benchmark = metrics
+                    ) else msg
+                } }
+            } catch (e: Exception) {
+                _messages.update { list -> list.map { msg ->
+                    if (msg.id == botMsgId) msg.copy(
+                        text = "⚠️ GGUF inference failed: ${e.localizedMessage}", isStreaming = false
+                    ) else msg
+                } }
+            } finally {
+                _isGenerating.value = false
+                if (deferredNativeClose.getAndSet(false)) {
+                    withContext(NonCancellable + Dispatchers.IO) { active.close() }
+                }
+            }
+        }
+    }
+
+    fun stopGeneration() {
+        if (_isGgufModel.value) stopDolphin.set(true)
+    }
+
     /**
      * Clear conversation history and create a fresh session.
      */
     fun clearChat() {
+        if (_isGenerating.value) return
+        if (_isGgufModel.value) {
+            _messages.value = emptyList()
+            return
+        }
         viewModelScope.launch {
             _messages.value = emptyList()
             try {
@@ -636,6 +729,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
+        stopDolphin.set(true)
+        if (_isGenerating.value && _isGgufModel.value) {
+            deferredNativeClose.set(true)
+        } else {
+            dolphinEngine?.close()
+        }
         super.onCleared()
         try {
             conversation?.close()
