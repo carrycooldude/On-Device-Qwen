@@ -2,6 +2,15 @@ package com.example.on_device_qwen.viewmodel
 
 import android.app.Application
 import android.os.Environment
+import android.os.SystemClock
+import android.net.Uri
+import android.provider.OpenableColumns
+import com.example.on_device_qwen.inference.ChunkListener
+import com.example.on_device_qwen.inference.DolphinNativeEngine
+import com.example.on_device_qwen.model.BenchmarkMetrics
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.NonCancellable
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.on_device_qwen.model.ChatMessage
@@ -67,6 +76,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var engine: Engine? = null
     private var conversation: Conversation? = null
     private var currentModelFile: File? = null
+    private var dolphinEngine: DolphinNativeEngine? = null
+    private val stopDolphin = AtomicBoolean(false)
+    private val deferredNativeClose = AtomicBoolean(false)
+    private val _isGgufModel = MutableStateFlow(false)
+    val isGgufModel: StateFlow<Boolean> = _isGgufModel.asStateFlow()
 
     /** Search directories where model files might be placed. */
     private val searchDirectories: List<File>
@@ -90,7 +104,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         explicitModelFile: File? = null,
         requestedBackend: BackendType? = null
     ) {
-        if (_engineState.value is EngineState.Loading) {
+        if (_engineState.value is EngineState.Loading || _isGenerating.value) {
             return // already loading
         }
 
@@ -104,8 +118,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 withContext(Dispatchers.IO) {
                     try { conversation?.close() } catch (_: Exception) {}
                     try { engine?.close() } catch (_: Exception) {}
+                    try { dolphinEngine?.close() } catch (_: Exception) {}
                     conversation = null
                     engine = null
+                    dolphinEngine = null
                 }
 
                 // ── Refresh available models list ────────────────────
@@ -121,7 +137,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         buildString {
                             appendLine("Model file not found!")
                             appendLine()
-                            appendLine("Please push a .litertlm model to one of:")
+                            appendLine("Import Dolphin GGUF or push a .litertlm model to one of:")
                             searchDirectories.forEach { appendLine("  • ${it.absolutePath}") }
                             appendLine()
                             appendLine("Quick ADB command:")
@@ -136,8 +152,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 currentModelFile = modelFile
                 _modelTitle.value = modelFile.nameWithoutExtension
 
-                val isVlm = modelFile.nameWithoutExtension.lowercase().contains("vl")
+                val isGguf = modelFile.extension.equals("gguf", ignoreCase = true)
+                _isGgufModel.value = isGguf
+                val isVlm = !isGguf && modelFile.nameWithoutExtension.lowercase().contains("vl")
                 _isVisionModel.value = isVlm
+                if (isGguf) {
+                    _currentBackend.value = BackendType.CPU
+                    _engineState.value = EngineState.Loading("Loading Dolphin GGUF on CPU…")
+                    withContext(Dispatchers.IO) {
+                        dolphinEngine = DolphinNativeEngine().also { it.load(modelFile) }
+                    }
+                    _engineState.value = EngineState.Ready
+                    return@launch
+                }
 
                 // ── Create EngineConfig & initialize ────────────────
                 val backendType = _currentBackend.value
@@ -217,6 +244,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * Switch to a different model on the device.
      */
     fun switchModel(modelFile: File) {
+        if (_isGenerating.value) return
         _messages.value = emptyList()
         currentModelFile = modelFile
         initializeEngine(modelFile)
@@ -226,7 +254,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * Switch backend (CPU, GPU, NPU).
      */
     fun switchBackend(backend: BackendType) {
-        if (_isGenerating.value) return
+        if (_isGenerating.value || _isGgufModel.value) return
         _messages.value = emptyList()
         initializeEngine(requestedBackend = backend)
     }
@@ -243,10 +271,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             if (!dir.exists() || !dir.isDirectory) continue
             val files = dir.listFiles { _, name ->
                 val lower = name.lowercase()
-                lower.contains("qwen") &&
+                (lower.contains("qwen") &&
                 !lower.contains("gemma") &&
                 !lower.contains("qwen35") &&
-                (lower.endsWith(".litertlm") || lower.endsWith(".litertl"))
+                (lower.endsWith(".litertlm") || lower.endsWith(".litertl"))) ||
+                (lower.contains("dolphin3.0-qwen2.5-3b") && lower.endsWith(".gguf"))
             } ?: continue
 
             for (file in files) {
@@ -318,7 +347,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      */
     private fun prepareReadableFile(source: File): File {
         val app = getApplication<Application>()
-        val targetName = if (source.name.endsWith(".litertlm", ignoreCase = true)) {
+        val targetName = if (source.extension.equals("gguf", ignoreCase = true) ||
+            source.name.endsWith(".litertlm", ignoreCase = true)) {
             source.name
         } else {
             "${source.nameWithoutExtension}.litertlm"
@@ -341,6 +371,46 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             dest
         } catch (_: Exception) {
             source
+        }
+    }
+
+    /** Import Dolphin 3.0 GGUF via the document picker, off the UI thread. */
+    fun importDolphinGguf(uri: Uri) {
+        if (_isGenerating.value || _engineState.value is EngineState.Loading) return
+        viewModelScope.launch {
+            _engineState.value = EngineState.Loading("Importing Dolphin GGUF to private storage…")
+            try {
+                val copied = withContext(Dispatchers.IO) {
+                    val app = getApplication<Application>()
+                    val sourceName = app.contentResolver.query(
+                        uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null
+                    )?.use { cursor ->
+                        if (cursor.moveToFirst()) cursor.getString(0) else null
+                    } ?: "Dolphin3.0-Qwen2.5-3b-Q4_K_M.gguf"
+                    require(sourceName.matches(Regex(
+                        "Dolphin3[.]0-Qwen2[.]5-3b[-_a-zA-Z0-9.]*[.]gguf",
+                        RegexOption.IGNORE_CASE
+                    ))) { "Select a Dolphin3.0-Qwen2.5-3b GGUF file" }
+                    val destination = File(app.filesDir, sourceName)
+                    val temporary = File(app.filesDir, "${sourceName}.partial")
+                    try {
+                        app.contentResolver.openInputStream(uri)?.use { input ->
+                            temporary.outputStream().use { output -> input.copyTo(output) }
+                        } ?: error("Cannot read selected model file")
+                        require(temporary.length() > 1_048_576) { "Incomplete GGUF model" }
+                        if (destination.exists()) check(destination.delete()) { "Cannot replace previous model" }
+                        check(temporary.renameTo(destination)) { "Unable to finalize model import" }
+                        destination
+                    } finally {
+                        if (temporary.exists()) temporary.delete()
+                    }
+                }
+                _engineState.value = EngineState.Idle
+                currentModelFile = copied
+                initializeEngine(copied)
+            } catch (e: Exception) {
+                _engineState.value = EngineState.Error("Dolphin import failed: ${e.localizedMessage}")
+            }
         }
     }
 
